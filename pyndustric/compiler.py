@@ -4,7 +4,8 @@ from dataclasses import dataclass # standard python module for simple classes us
 from collections import Counter   # dictionary subclass used to count instances of different types of label/variable
 import inspect                    # standard python module used to retrieve source code from functions to compile them
 import textwrap                   # standard python module used for changing indentation, e.g., of source code
-
+from pathlib import Path           # standard python module for handling filenames to load compilable code from file
+from typing import Callable, Union # used for type-checking / debugging
 
 from .constants import *          # definitions of various constants mapping Python entitites to mlog equivalents
 
@@ -94,7 +95,7 @@ class Compiler(ast.NodeVisitor):
         if not isinstance( content, Instruction ): content = Instruction(content) # coerce content to instruction
         self._ins.append( content )
 
-    def compile(self, code):
+    def compile(self, code: Union[str, Callable, Path]):
         """This is the main function for the compiler taking in a chunk of Python code (specified either as a
         string, as a function whose source code file can be found via python's inspect module,
         or TODO as a Path indicating a source code file to compile.
@@ -104,6 +105,8 @@ class Compiler(ast.NodeVisitor):
 
         # TODO enable this to handle function and Path inputs, not just strings
         body: list[ast.AST]  # will store one or more AST nodes composing the body of code to be compiled
+
+
         if callable(code): # if code is given as a function, we'll compile its body (ignoring def and docstring)
             code = textwrap.dedent( inspect.getsource(code) ) # looks up function's source code from file
             body = ast.parse(code).body[0].body # i.e., tree.body_of_tree[0th stmt, namely "def..."].body_of_function
@@ -170,14 +173,21 @@ class Compiler(ast.NodeVisitor):
     def create_Assign(self, variable: str, newvalue: ast.AST):
         """Appends one or more Instructions to assign to variable the value specified in AST node newvalue.
            This is used to compile explicit assignment to a user-specified variable, and also to assign values
-           to dummy variables to store intermediate results in complex expressions."""
+           to dummy variables to store intermediate results in complex expressions, and
+           TODO in passing arguments and return values to/from functions.
+           The division of labor is this: (1) something else, e.g. visit_Assign, determines that we should have
+           instructions assign some value to a variable, (2) create_Assign figures out which mlog instruction would
+           be best suited for doing this, usually set, op, or sensor, and it calls (3) as_value to figure out what
+           value(s) will need to be plugged into the remaining gap(s) in that instruction, often inserting preceding
+           instructions to store intermediate values for complex expressions in dummy variables, another instance of (1).
+        """
 
         print(f"\nCreating assignment instruction(s) for {variable} = {ast.dump(newvalue)}")
 
         if isinstance(newvalue, ast.BinOp):  # if expression is a binary operation, e.g., a+b
             op = BIN_OPS.get(type(newvalue.op)) # look up equivalent op in dict of mlog binary ops, or None if not there
             if op is None:
-                raise CompilerError(ERR_UNSUPPORTED_OP, node)
+                raise CompilerError(ERR_UNSUPPORTED_OP, newvalue)
 
             left = self.as_value(newvalue.left)
             right = self.as_value(newvalue.right)
@@ -196,30 +206,72 @@ class Compiler(ast.NodeVisitor):
             right = self.as_value(newvalue.comparators[0])
             self.ins_append(f'op {cmp} {variable} {left} {right}') # e.g. "x = y<z" compiles to "op lessThan x y z"
 
-            #TODO again needs to be generalized to handle expressions in other contexts
-            #TODO there's no reason to keep this separate from the preceding case, given how closely parallel they are
+        elif isinstance(newvalue, ast.Call):  # if newvalue is a function/method call, e.g. abs(x) or Sensor.copper(...)
+            if isinstance(newvalue.func, ast.Attribute): # if newvalue has the form obj.method(args)
+                obj = newvalue.func.value.id
+                method = newvalue.func.attr
+                if obj == 'Unit':    # Unit.method( args )
+                    if method == "radar":
+                        self.radar_instruction(variable, obj, newvalue)
+                    elif method in UNIT_FIND_METHODS:
+                        pass #TODO
+                    # TODO are there any other Unit.methods that return a value?
+                elif obj == 'Sensor':  # Sensor.method( args )
+                    if len(newvalue.args) != 1:
+                        raise CompilerError(ERR_ARGC_MISMATCH, newvalue)
 
-        elif isinstance(newvalue, ast.Call) \
-                and isinstance(newvalue.func, ast.Attribute) \
-                and newvalue.func.value.id == 'Sensor':  # if this node is of the form Sensor.attr( args )
-            if len(newvalue.args) != 1:
-                raise CompilerError(ERR_ARGC_MISMATCH, node)
+                    arg = newvalue.args[0].id
 
-            arg = newvalue.args[0].id
+                    attr = RES_MAP.get( method ) # e.g. if we're doing Sensor.copper(block), this will be '@copper'
+                    if attr is None:
+                        raise CompilerError(ERR_UNSUPPORTED_SYSCALL, newvalue)
 
-            attr = RES_MAP.get(newvalue.func.attr)
-            if attr is None:
-                raise CompilerError(ERR_UNSUPPORTED_SYSCALL, node)
+                    self.ins_append(f'sensor {variable} {arg} {attr}')
+                    # TODO now that there is a cleaner object.attribute interface for this, may want to deprecate Sensor?
+                else:  # if the object whose method is being called isn't one with idiomatic methods
+                    if method == "radar":
+                        self.radar_instruction(variable, obj, newvalue)
 
-            self.ins_append(f'sensor {variable} {arg} {attr}') # "x=Sensor.copper(vault1)"->"sensor x vault1 @copper"
+                    # TODO are there any other obj.methods that return values?
+                    else:  # couldn't figure out any way to handle this obj.method call
+                        raise CompilerError(ERR_NO_DEF, newvalue )
+
+            elif isinstance(newvalue.func, ast.Name):  # if newvalue has the form functionname(args)
+                function = newvalue.func.id
+                if function in FUNCTION_OPS: # e.g. abs(x) or dst(x,y)
+                    self.ins_append(f"op {function} {variable} " +
+                                    ' '.join(self.as_value(arg) for arg in newvalue.args))
+
+                elif function in self._functions:  # if this is in our repository of user-defined functions
+                    fn = self._functions[function]
+
+                    if len(newvalue.args) != fn.argc:
+                        raise CompilerError(ERR_ARGC_MISMATCH, node)
+
+                    for arg in newvalue.args:
+                        val = self.as_value(arg)
+                        self.ins_append(f'write {val} cell1 {REG_STACK}')
+                        self.ins_append(f'op add {REG_STACK} {REG_STACK} 1')
+                    # TODO  probably better to set the values straight into the relevant variables, rather than slowly piping through stack
+
+                    # `REG_STACK` is not updated because it's immediately read by the function.
+                    # If it was, the `op add` followed by the `op sub` would be redundant.
+                    self.ins_append(f'write @counter cell1 {REG_STACK}')
+                    self.ins_append(f'jump {fn.start} always')
+                    return REG_RET
+
+                else:  # couldn't figure out any way to handle this function call
+                    raise CompilerError(ERR_NO_DEF, newvalue)
+
 
         # TODO determine where to handle any other object-attribute based calls, like Unit.approach() or salvo1.shoot()?
+        # TODO allow calling of user-defined functions at beginning of expression, not just in assignment
 
         elif isinstance(newvalue, ast.Attribute): # e.g., vault1.copper
-            # We're dealing with an ast like this: newvalue = Attribute(value=Name(id='vault1'), attr='copper' )
-            # TODO may want to generate our own compiler errors for type mismatches
-            obj  = newvalue.value.id # e.g. vault1
-            attr:str  = newvalue.attr # e.g. copper
+            # The ast should be structured like this: newvalue = Attribute(value=Name(id='vault1'), attr='copper' )
+            # TODO may want to generate our own compiler errors for type mismatches?
+            obj:str =  newvalue.value.id # e.g. vault1
+            attr:str = newvalue.attr     # e.g. copper
 
             # TODO vectorize operations on vector attributes .pos .shootPos and .minePos
             # TODO screen other idiomatic object.attribute references that shouldn't compile to sensor instructions?
@@ -228,10 +280,42 @@ class Compiler(ast.NodeVisitor):
             self.ins_append(f'sensor {variable} {obj} {mlog_attr}') # "x = vault1.copper"->"sensor x vault1 @copper"
 
         else:  # for any other value
-            val = self.as_value(newvalue)  # as_value() tries to coerce value to be some val that mlog can assign to x
-            self.ins_append(f'set {variable} {val}')  # and compile this to "set x val"
+            val = self.as_value(newvalue, allow_dummy=False)  # "set x new_dummy" would be useless and circular
+            self.ins_append(f'set {variable} {val}')  # and compile this to "set variable val"
 
-            #TODO need to rethink the division of labor between as_value and a generalized expression handler
+    def radar_instruction(self, variable, obj, newvalue):
+        """This will be called for any instance where a variable will be set to a radar reading from object obj,
+           which will either be 'Unit' or the name of some Block, which will compile to uradar or radar, respectively.
+           Newvalue will be the ast node for this radar call.  This will extract the relevant arguments from that node.
+           This treats the method as though it had the following def radar( self, criterion1, criterion2=any,
+           criterion3=any, order=1, key=distance ), so later criteria, order and key are optional.  The order
+           boolean accepts min and max as values.
+        """
+        # The newvalue ast node should have the following structure:
+        # Call(func=Attribute(value=Name(id='Unit'), attr='radar'),
+        #      args=[ Name(id='enemy'), Name(id='flying') ],
+        #      keywords=[keyword(arg='order', value=Name(id='min')),
+        #                keyword(arg='key', value=Name(id='distance'))])
+
+        if obj=="Unit":
+            radar = "uradar" # radar from bound Unit uses "uradar" instruction
+            obj = "@unit" # the text version of uradar apparently still demands an actual object anyway
+        else:
+            radar = "radar" # radar from blocks uses radar instruction, and the block as the object
+
+        criteria = ' '.join( arg.id for arg in newvalue.args )
+        while criteria.count(' ')<2: criteria += " any"  # mlog requires 3 criteria, even if they're "any"
+
+        kwargs = dict(order='min', key='distance') # default values for keyword args
+        kwargs.update({ k.arg : self.as_value(k.value) for k in newvalue.keywords}) # overwrite with given keyword args
+        print(f"\nUsing keyword args: {kwargs}" )
+        kwargs['order'] = RADAR_ORDERS.get( kwargs['order'] ) # order can accept unusual values like min, max
+        if kwargs['order'] is None:
+            raise CompilerError(ERR_UNSUPPORTED_EXPR, newvalue )
+
+        if kwargs['order'] in ['min','max']:  # we allow min and max as order args, map to 1,0
+            kwargs['order'] = 1 if kwargs['order'] == 'min' else 0
+        self.ins_append(f"{radar} {criteria} {kwargs['key']} {obj} {kwargs['order']} {variable}")
 
     def visit_AugAssign(self, node: ast.Assign):
         """This will be called for any* augmenting assignment statement, like "x += 1"  """
@@ -288,8 +372,6 @@ class Compiler(ast.NodeVisitor):
         else: # we can just use the built-in mlog binary comparison cmp
             self.ins_append(f'jump {destination_label} {cmp} {left} {right}')
 
-        # TODO: logical-and does not have a negated version in mlog, but should be allowed!  Telos: DONE!
-        # TODO: mlog doesn't support logical-or directly, but we should!  Telos: DONE!
 
     def visit_If(self, node):
         """This will be called for any* if statement, like "if test: body" potentially with elif/else clauses."""
@@ -305,9 +387,6 @@ class Compiler(ast.NodeVisitor):
                 self.visit(subnode)
         self.ins_append(endif_label) # mark where to jump to if we need to skip past whatever preceded this
 
-        # TODO when there is no else clause, should negate the test to reduce jumps by one.  Telos: DONE!
-        # TODO if we want to support OR, one place to do so is here (another would be non-if expressions) Telos: DONE!
-
     def visit_While(self, node):
         """This will be called for any* while loop."""
         body_label = self.Label("while_body") # will mark the beginning of the body of the loop
@@ -318,17 +397,6 @@ class Compiler(ast.NodeVisitor):
             self.visit(subnode)
         self.conditional_jump(body_label, node.test, jump_if_test=True) # if test is still true, loop back up
         self.ins_append(end_label) # mark end of while loop
-
-        # TODO in cases where the test is a comparison, it can be combined with the jump for efficiency as it is for if
-        #      Telos: DONE!
-
-        # TODO reconsider situating the test after the body of the loop; in the case where the test is initially false,
-        #      it'd have been faster to have the (negated) test at the beginning (much like an if with no else);
-        #      in other cases this ends up being a wash.  In the case where the test is atomic or a simple comparison,
-        #      it'd be most efficient to duplicate the 1-line test at top and bottom, since a conditional jump takes no
-        #      more instructions than an unconditional one does, and this would take one less cycle when the test is
-        #      initially false.
-        #      Telos: DONE!
 
         # TODO: In a case where the test is complex, we could trade away a tiny bit of speed to get a large reduction
         #       in instruction count by not duplicating the test.  However, instruction count matters only when a
@@ -680,11 +748,24 @@ class Compiler(ast.NodeVisitor):
         else:
             raise CompilerError(ERR_UNSUPPORTED_SYSCALL, node)
 
-    def as_value(self, node):
-        """This will be called by various visit methods when they encounter something to treat as an atomic expression,
-           e.g. for the y and 3 in x=y+3.  This coerces the given node to a string that can appear in mlog code."""
-
-        # TODO figure out balance of labor between this and other things in evaluating complex expressions
+    def as_value(self, node, allow_dummy = True):
+        """This will be called by various other methods when they encounter some node that they'll need to treat as an
+           atomic expression in mlog code, e.g. for both y and 3 in x=y+3.  This coerces the given node to a string that
+           can appear in mlog code.  In the case where node is itself complex (e.g., the y*2 in x = 1 + y*2), this
+           first creates one or more instructions to assign a dummy variable to the value in node (roughly dummy = y*2)
+           and then returns that dummy for inclusion in whatever instruction needed an atomic way of referring to this
+           complex value.
+           This method first tries to see if node is anything it knows how to turn into an atomic expression,
+           e.g., a constant (like 1 or "yarn"), a variable name (like x), or an idiomatic expressions for special mlog
+           variables like @unit and @this.  Anything else is assumed to be some sort of complex expression that
+           will take additional instruction(s) to turn into something atomic, so a new dummy variable will be created
+           to store the value of this complex expression, so that we can return this dummy variable to serve as an
+           atom in some larger expression, which is what as_value was called upon to do.  We then pass the buck
+           (often back) to create_assign to figure out how to assign the right value to this dummy.
+           This use of dummy variables will be disabled when allow_dummy is not True (e.g. when create_assign is
+           trying to fill in the right hand side of x = ___), which can prevent infinite loops that could arise when
+           neither create_assign nor as_value knows a good way to approach some node. In that case an error is raised.
+           """
 
         if isinstance(node, ast.Constant):  # constants include True, 1.5, and "yarn"
             if isinstance(node.value, bool):
@@ -701,40 +782,33 @@ class Compiler(ast.NodeVisitor):
             # TODO should this raise a CompilerError like most other errors do?
             #      I guess the plan is that as_value won't get called for variables in the .Store context (e.g.,
             #      the x in x = y) so this assertion would just serve to warn us that we'd called as_value at a time
-            #      that we hadn't meant to?
+            #      that we hadn't meant to, so the error is probably ours and not the users, so no compiler error?
+            #      Should probably just remove this once we're confident our code works?
+
+            #TODO capture special variable names like Unit and This and map them to their mlog equivs @unit, @this
+
             return node.id
 
-        elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Attribute):
-                if node.func.value.id == 'Env':
-                    return self.env_as_value(node.func)
-                else:
-                    raise CompilerError(ERR_COMPLEX_VALUE, node)
-            # TODO  It looks like this is the place to handle object attributes like vault1.copper and Unit.x
+        # most calls will be handled in create_Assign. But Env.methods compile to @variables, so handled here.
+        elif ( isinstance(node, ast.Call) and
+               isinstance(node.func, ast.Attribute) and
+               node.func.value.id == 'Env'):
+            return self.env_as_value(node.func) # map Env.methods to variables, e.g Env.this() -> @this
 
-            fn = self._functions.get(node.func.id)
-            if fn is None:
-                raise CompilerError(ERR_NO_DEF, node)
+        # TODO if we want any Env.attributes (or other idiomatic object.attribute expressions that compile to atomic
+        #      mlog expressions) we'd need to catch them here
 
-            if len(node.args) != fn.argc:
-                raise CompilerError(ERR_ARGC_MISMATCH, node)
+        elif allow_dummy:
+            temp_variable = self.Dummy("temp")
+            #TODO it would aid readability of compiled code if we somehow set things up to make more informative names
+            #     for temp variables, e.g., using __sum23 to store the output of an addition op
+            #     One way of doing this would be to task CreateAssign with coming up with the temp variable at the
+            #     last moment, and returning it here
 
-            for arg in node.args:
-                val = self.as_value(arg)
-                self.ins_append(f'write {val} cell1 {REG_STACK}')
-                self.ins_append(f'op add {REG_STACK} {REG_STACK} 1')
-            # TODO  probably better to set the values straight into the relevant variables, rather than slowly piping through stack
-
-            # `REG_STACK` is not updated because it's immediately read by the function.
-            # If it was, the `op add` followed by the `op sub` would be redundant.
-            self.ins_append(f'write @counter cell1 {REG_STACK}')
-            self.ins_append(f'jump {fn.start} always')
-            return REG_RET
-            # TODO  probably better to pass the returned value via a dummy variable rather than piping through stack
-
+            self.create_Assign(temp_variable, node)
+            return temp_variable
         else:
             raise CompilerError(ERR_COMPLEX_VALUE, node)
-            # TODO This may be where we want code that handles complex expressions, like 1+2*3
 
     def env_as_value(self, node):
         """This is used to process expressions like Env.width, which compile to mlog globals like @mapw """

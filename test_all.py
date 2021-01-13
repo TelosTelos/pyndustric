@@ -202,6 +202,36 @@ def test_types():
     masm = pyndustric.Compiler().compile(source)
     assert masm == expected
 
+def test_function_ops():
+    def source():
+        a = abs( 1 )
+        lo = min( 1, 2 )
+
+    expected = as_masm('''\
+        op abs a 1
+        op min lo 1 2
+        ''')
+
+    masm = pyndustric.Compiler().compile(source)
+    assert masm == expected
+
+def test_complex_assign():
+    def source():
+        a = 2*x + 1
+        d = sqrt(x*x + y*y)
+
+    expected = as_masm('''\
+        op mul __temp_0 2 x
+        op add a __temp_0 1
+        op mul __temp_2 x x
+        op mul __temp_3 y y
+        op add __temp_1 __temp_2 __temp_3
+        op sqrt d __temp_1
+        ''')
+
+    masm = pyndustric.Compiler().compile(source)
+    assert masm == expected
+
 
 def test_aug_assignments():
     source = textwrap.dedent('''\
@@ -480,6 +510,66 @@ def test_def():
     masm = pyndustric.Compiler().compile(source)
     assert masm == expected
 
+def test_multi_call():
+    # TODO cells can't store strings, test that no fn args are
+    # TODO standalone calls are not supported
+    def source():
+        def f(i): return i
+        x = f(1)+f(2)
+
+    expected = as_masm('''\
+        set __pyc_sp 0
+        jump 8 always
+        read __pyc_rc_0 cell1 __pyc_sp
+        op sub __pyc_sp __pyc_sp 1
+        read i cell1 __pyc_sp
+        set __pyc_ret i
+        jump 7 always
+        op add @counter __pyc_rc_0 1
+        write 1 cell1 __pyc_sp
+        op add __pyc_sp __pyc_sp 1
+        write @counter cell1 __pyc_sp
+        jump 2 always
+        write 2 cell1 __pyc_sp
+        op add __pyc_sp __pyc_sp 1
+        write @counter cell1 __pyc_sp
+        jump 2 always
+        op add x __temp_0 __temp_1
+        ''')
+
+    masm = pyndustric.Compiler().compile(source)
+    assert masm == expected
+
+
+def test_complex_call():
+    # TODO cells can't store strings, test that no fn args are
+    # TODO standalone calls are not supported
+    def source():
+        def f(i): return i
+        x = 1*f(2+3)+4
+
+    expected = as_masm('''\
+        set __pyc_sp 0
+        jump 8 always
+        read __pyc_rc_0 cell1 __pyc_sp
+        op sub __pyc_sp __pyc_sp 1
+        read i cell1 __pyc_sp
+        set __pyc_ret i
+        jump 7 always
+        op add @counter __pyc_rc_0 1
+        op add __temp_2 2 3
+        write __temp_2 cell1 __pyc_sp
+        op add __pyc_sp __pyc_sp 1
+        write @counter cell1 __pyc_sp
+        jump 2 always
+        op mul __temp_0 1 __temp_1
+        op add x __temp_0 4
+        ''')
+
+    masm = pyndustric.Compiler().compile(source)
+    assert masm == expected
+
+
 
 def test_def_sideeffects():
     source = textwrap.dedent('''\
@@ -614,6 +704,19 @@ def test_object_attribute():
 
     expected = as_masm('''\
         sensor pf container1 @phase-fabric
+        ''')
+
+    masm = pyndustric.Compiler().compile(source)
+    assert masm == expected
+
+def test_radar():
+    def source(ripple1):
+        u1 = Unit.radar( enemy, flying, order = max, key = distance)
+        u2 = ripple1.radar( ally, key = health )
+
+    expected = as_masm('''\
+        uradar enemy flying any distance @unit 0 u1
+        radar ally any any health ripple1 1 u2
         ''')
 
     masm = pyndustric.Compiler().compile(source)

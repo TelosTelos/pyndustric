@@ -76,6 +76,28 @@ BIN_OPS = {
     ast.BitXor: 'xor',
 }
 
+FUNCTION_OPS = ['flip', 'max', 'min', 'xor', 'atan2', 'dst', 'noise', 'abs', 'log', 'log10', 'sin', 'cos', 'tan',
+                'floor', 'ceil', 'sqrt', 'rand']
+
+
+UNIT_FIND_METHODS = "find_ore find_building find_spawn find_damaged".split(' ')
+
+FIND_BUILDING_TYPES = ("core storage generator turret factory repair rally" +
+                       "battery resupply reactor unitModifier extinguisher").split(' ')
+
+# foundunit = radar( criterion1, criterion2 = 'any', criterion3='any', order=1, key='distance')
+
+# ulocate damaged core true @copper outx outy found building
+# uradar enemy any any distance turret1 1 result
+# radar enemy any any distance turret1 1 result
+
+
+RADAR_CRITERIA = "any enemy ally player attacker flying boss ground".split(' ')
+RADAR_ORDERS = {'min':'1', 'True' :'1', '1':'1',
+                'max':'0', 'False':'0', '0':'0' }
+
+
+
 ENV_TO_VAR = {
     'this': '@this',
     'x': '@thisx',
