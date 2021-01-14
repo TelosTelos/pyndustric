@@ -1,26 +1,22 @@
 import ast # standard python module for generating and using an abstract syntax tree (ast) representing python code
 
-from dataclasses import dataclass # standard python module for simple classes used just to store data in attributes
+from dataclasses import dataclass, field # standard python module to ease storing attributes in classes
 from collections import Counter   # dictionary subclass used to count instances of different types of label/variable
 import inspect                    # standard python module used to retrieve source code from functions to compile them
 import textwrap                   # standard python module used for changing indentation, e.g., of source code
 from pathlib import Path           # standard python module for handling filenames to load compilable code from file
-from typing import Callable, Union # used for type-checking / debugging
+from typing import Callable, Union, List, Set # used for type-checking / debugging
 
 from .constants import *          # definitions of various constants mapping Python entitites to mlog equivalents
 
-@dataclass
-class Function:
-    """This stores information about a user-defined function that is callable within a compilable program."""
-    start: int   #  Line number for the start of the function within the compiled program
-    argc: int    #  Count of number of arguments the function takes
+
 
 class _Label(str):
     """This subclass of str stores information about a label that can be used to mark a destination for mlog jump
        commands. Each label itself is a string of the form "{labelname}", which is how it will appear in instructions
        until eventually being replaced with an actual line number.
        During its creation, each label creates a .destination no-op instruction, which can be included in a
-       compilers ._ins list of instructions as a placeholder to mark the destination for jumps involving this label.
+       compilers ._main list of instructions as a placeholder to mark the destination for jumps involving this label.
        This class name is prefixed with an underscore to discourage accidental use of it.  New labels should
        should typically be created using compiler.Label(prefix) which will auto-generate a unique (within that
        compiler) name with that prefix, and call _Label() to create a label with that unique name."""
@@ -37,17 +33,20 @@ class _Label(str):
 
 class Instruction(str):
     """This subclass of str stores information about an instruction line that is being prepared for inclusion
-       in compiled mindustry assembly (masm) code.  Instructions will be listed in a compiler object's ._ins
-       attribute, until eventually being concatenated to make output compiled code.  An instruction created
-       via Instruction( some_Label ) will be a no-op empty string, but will remember that Label as self.label .
+       in compiled mindustry assembly (masm) code.  Instructions will be listed in a compiler object's ._main
+       attribute, and within various function objects, until eventually being concatenated to make output compiled code.
+       An instruction created via Instruction( some_Label ) will be a no-op empty string, but will remember that
+       Label as self.label .
        Each non-empty Instruction should be a valid mlog instruction *except* that line number destinations for jump
        instructions should instead have something of the form {labelname} in place of the line number, which
-       will be replaced with an actual line number in the finalized output."""
+       will be replaced with an actual line number in the finalized output.  And *except* that instructions in
+       function definitions will wrap argument names in braces, to enable substitution."""
 
     linenumber: int  #  Line number for this in the final output (or for next op instruction if this is no_op)
     label: _Label    #  Indicates what label if any, marks this instruction as its destination
 
     def __new__(cls, content ):
+        if isinstance(content, Instruction): return content
         if isinstance( content, _Label ):
             i = super().__new__(cls, "")
             i.label = content
@@ -55,6 +54,82 @@ class Instruction(str):
             i = super().__new__(cls, content)
             i.label = None
         return i
+
+    def __repr__(self): return self if self else ( f"LABEL: {self.label.name}" if self.label else "" )
+
+    @property
+    def is_non_continuing(self):
+        """Returns true if this instruction never lets flow of execution flow on to the next instruction, e.g.
+           because it jumps away always, because it sets the @counter to a new location, or because it end's"""
+        if self == "end": return True
+        if self.startswith("jump") and self.endswith("always"): return True
+        if self.startswith("set @counter"): return True
+        if self.startswith("op @counter"): return True
+        return False
+
+
+class PartialMap( dict ):
+    """This is much like an ordinary dict except for any failed attempt to look up a string, this returns
+       that string rewrapped in {}.  This sort of mapping can be used with Python's str.format to substitute
+       values for specified {}-wrapped items, while leaving unspecified {}-wrapped items unchanged."""
+    def __missing__(self, key):
+        return '{' + key + '}'
+
+
+class Function:
+    """This stores information about a user-defined function that is callable within a compilable program."""
+
+    def __init__(self, name:str, mode:str, args:List[str] = None):
+        self.name = name # name of this function, e.g. 'foo'
+        self.mode = mode # compilation mode, 'inline' or 'function'
+        self.call_label = _Label(f"__{name}_CALL")
+        self.end_label = _Label(f"__{name}_END")
+        self.return_label = _Label(f"__RETURN_FROM_{name}") # won't be used as dest, but helps optimization
+        self.return_value = f"__{name}_RETURN_VALUE"
+        self.return_line = f"__{name}_RETURN_LINE"
+        self.args: List[str] = args if args else [] # list of args the function takes
+        self.ins: List[Instruction] = [] # list of instructions in body of function, with args in {}
+        self.labels: Set[_Label] = set() # set of destination labels in body of function (must be mangled when inline)
+        self.instances = 0 # count of how many times an inline function is put inline, used for mangling
+
+    def jump_back_instruction(self, at_end = False):
+        if self.mode == 'inline':
+            if at_end: return None # an inline function at its end will automatically advance the right place
+            return f'jump {self.end_label} always' # jump to the end of this inline function
+        else: # jumpy functions jump back to whatever line the caller stored in the var named by self.return_line
+            return f'set @counter {self.return_line}'
+
+    @property
+    def extended_args(self): return self.args+[self.return_value]
+
+    def mangle(self, arg):
+        """Returns a mangled version of arg, to ensure that arguments used in this function won't collide with
+           like-named variables elsewhere in the program, for non-inline functions."""
+        return f"__{self.name}_{arg}"
+
+    def mapped_ins(self, mapping={}):
+        """Returns the list of self's instructions, with arguments and return_value mapped to their destinations in the
+           given mapping.  Any args not given in mapping will be mapped to themselves."""
+        if self.mode == "inline":
+            m={a: a for a in self.args} # start with default map that takes each arg to itself
+            # we must mangle labels for jumps within this inline instance to avoid cross-jumping with other instances
+            labelmap = {L.name : _Label('__'+self.name+'_'+str(self.instances)+'_'+L.name) for L in self.labels }
+            m.update( labelmap ) # now we'll mangle the labels in jump commands (but not their destinations yet)
+            self.instances += 1  # next instance of this inline fn, the mangled labels will be one higher
+        else:
+            m={a: self.mangle(a) for a in self.args} # mangle the name of each arg to differ from globals
+            labelmap={} # no need to mangle labels for out-of-line functions
+        m[self.return_value] = self.return_value # map the return_value to itself
+        m.update( mapping )  # now override defaults with anything in the given mapping
+        m = PartialMap(m) # m will now rewrap any unfound items, like jump labels, in {} so they can be subbed later
+
+        # now we can make all the substitutions described above, formatting op instructions, and labelmapping labels
+        return list(map(Instruction, ((i.format_map(m) if i else
+                                       labelmap.get(i.label.name if i.label else None,i)) for i in self.ins )))
+
+
+
+
 
 class CompilerError(ValueError):
     def __init__(self, code, node: ast.AST):
@@ -67,9 +142,9 @@ class Compiler(ast.NodeVisitor):
     parent nodes typically opt to initiate visits for their children.  This subclass overwrites the default visit
     methods with ones that generate compiled mlog code as the various parts of the tree are visited."""
     def __init__(self):
-        # self._ins will end up being a list of instructions that will compose the compiled code.
-        # we begin with an instruction to initialize the stack
-        self._ins = [ Instruction( f'set {REG_STACK} 0') ]
+        # self._main = [ Instruction( f'set {REG_STACK} 0') ] # initialize the stack # stack has been removed
+        self._main:List[Instruction] = [] # list of instructions that will compose main body of compiled code
+        self._current = self._main        # list of instructions we're currently adding to: main / function body
         #TODO I'm not sure we really want/need a stack by default -- probly better to do everything with dummy variables
         self._in_def = None   # will be set to a True-ish value while visiting user-defined function definitions
         self._functions = {}  # will map user defined function names to Function objects containing info about functions
@@ -91,9 +166,16 @@ class Compiler(ast.NodeVisitor):
         return f"__{prefix}_{index}"
 
     def ins_append( self, content ):
-        """This appends to this compiler's list ._ins of instructions an Instruction with content content."""
-        if not isinstance( content, Instruction ): content = Instruction(content) # coerce content to instruction
-        self._ins.append( content )
+        """This appends an Instruction (or list thereof) with content content to whatever ._current list of
+           instructions we are currently adding to, either the main program or a function body."""
+        if content is None: return # no point in appending completely content-less instructions
+        if not isinstance(content, list): content=[content] # wrap single instruction in singleton list
+        for i in content:
+            if not isinstance( i, Instruction ): i = Instruction(i) # coerce i to instruction
+            self._current.append( i )
+            if self._in_def:
+                if i.label: self._in_def.labels.add(i.label) # remember this label is jump destination within function
+
 
     def compile(self, code: Union[str, Callable, Path]):
         """This is the main function for the compiler taking in a chunk of Python code (specified either as a
@@ -157,18 +239,15 @@ class Compiler(ast.NodeVisitor):
     def visit_Assign(self, node: ast.Assign):
         """This will be called for any* statement of the form "{targets} = {values}"
         """
-        target = node.targets[0] # the variable we'll assign a value to, e.g., the x in "x = 1"
-        if not isinstance(target, ast.Name):
-            raise CompilerError(ERR_COMPLEX_ASSIGN, node)
-            # TODO This rules out x,y = 30,50 (for which targets[0] will be the tuple (x,y) )  May want to support that?
-            # TODO Take care with how this will interact with vectorized operations
+        target = self.as_target( node.targets[0] ) # the variable we'll assign a value to, e.g., the x in "x = 1"
 
-        self.create_Assign( target.id, node.value ) # Create instruction(s) to set target = value
+        self.create_Assign( target, node.value ) # Create instruction(s) to set target = value
 
         if len(node.targets) > 1: # if this was a multi-assignment like x = y = 0
             # TODO ERR_MULTI_ASSIGN was raised here, but now this compiles fine. Could delete this error + its test.
             for additional_target in node.targets[1:]:
-                self.ins_append(f"set {additional_target.id} {target.id}") # set the later targets to mimic first
+                t = self.as_target(additional_target)
+                self.ins_append(f"set {t} {target}") # set the later targets to mimic first
 
     def create_Assign(self, variable: str, newvalue: ast.AST):
         """Appends one or more Instructions to assign to variable the value specified in AST node newvalue.
@@ -182,7 +261,7 @@ class Compiler(ast.NodeVisitor):
            instructions to store intermediate values for complex expressions in dummy variables, another instance of (1).
         """
 
-        print(f"\nCreating assignment instruction(s) for {variable} = {ast.dump(newvalue)}")
+        # print(f"\nCreating assignment instruction(s) for {variable} = {ast.dump(newvalue)}")
 
         if isinstance(newvalue, ast.BinOp):  # if expression is a binary operation, e.g., a+b
             op = BIN_OPS.get(type(newvalue.op)) # look up equivalent op in dict of mlog binary ops, or None if not there
@@ -245,24 +324,32 @@ class Compiler(ast.NodeVisitor):
                 elif function in self._functions:  # if this is in our repository of user-defined functions
                     fn = self._functions[function]
 
-                    if len(newvalue.args) != fn.argc:
-                        raise CompilerError(ERR_ARGC_MISMATCH, node)
+                    if len(newvalue.args) != len(fn.args):
+                        raise CompilerError(ERR_ARGC_MISMATCH, newvalue)
 
-                    for arg in newvalue.args:
-                        val = self.as_value(arg)
-                        self.ins_append(f'write {val} cell1 {REG_STACK}')
-                        self.ins_append(f'op add {REG_STACK} {REG_STACK} 1')
-                    # TODO  probably better to set the values straight into the relevant variables, rather than slowly piping through stack
+                    if fn.mode == "inline":
+                        # For inline macrolike functions, we map each instance of an arg in the function's body to the
+                        # given value for that arg, and map the return value to the variable we're aiming to store
+                        # newvalue into, and then we'll plunk the resulting code inline right here.
+                        # Note: variable values will appear as-is in the function, so may be altered by it.
+                        # Complex values will be set to temp variables, so are safe from this.  Constant values will
+                        # be substituted into the place of their args within the function body.
+                        # TODO could be good to raise an error when passing constant value to arg that fn reassigns
+                        mapping = { arg: self.as_value(node) for arg, node in zip( fn.args, newvalue.args ) }
+                        mapping[fn.return_value] = variable # wherever fn sets its return, it'll set variable for us
+                        self.ins_append( fn.mapped_ins( mapping ) )
 
-                    # `REG_STACK` is not updated because it's immediately read by the function.
-                    # If it was, the `op add` followed by the `op sub` would be redundant.
-                    self.ins_append(f'write @counter cell1 {REG_STACK}')
-                    self.ins_append(f'jump {fn.start} always')
-                    return REG_RET
+                    else: # if this is a jumpy out-of-line function
+                        for arg,value in zip(fn.args, newvalue.args): # assign/"pass" values for each (mangled) arg
+                            self.create_Assign( fn.mangle(arg), value )
+                        self.ins_append(f'op add {fn.return_line} @counter 1') # Tell fn where it should jump back to
+                        self.ins_append(f'jump {fn.call_label} always')        # Jump to the start of fn's body
+                        # After executing, and setting its return_value, the function will jump back here
+                        self.ins_append(fn.return_label) # This label won't be a destination, but helps optimization
+                        self.ins_append(f'set {variable} {fn.return_value}')   # set variable = return_value: Job done!
 
                 else:  # couldn't figure out any way to handle this function call
                     raise CompilerError(ERR_NO_DEF, newvalue)
-
 
         # TODO determine where to handle any other object-attribute based calls, like Unit.approach() or salvo1.shoot()?
         # TODO allow calling of user-defined functions at beginning of expression, not just in assignment
@@ -308,7 +395,7 @@ class Compiler(ast.NodeVisitor):
 
         kwargs = dict(order='min', key='distance') # default values for keyword args
         kwargs.update({ k.arg : self.as_value(k.value) for k in newvalue.keywords}) # overwrite with given keyword args
-        print(f"\nUsing keyword args: {kwargs}" )
+        # print(f"\nUsing keyword args: {kwargs}" )
         kwargs['order'] = RADAR_ORDERS.get( kwargs['order'] ) # order can accept unusual values like min, max
         if kwargs['order'] is None:
             raise CompilerError(ERR_UNSUPPORTED_EXPR, newvalue )
@@ -319,16 +406,16 @@ class Compiler(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.Assign):
         """This will be called for any* augmenting assignment statement, like "x += 1"  """
-        target = node.target # e.g., x in "x += 1"
-        if not isinstance(target, ast.Name):
-            raise CompilerError(ERR_COMPLEX_ASSIGN, node)
+        target = self.as_target( node.target ) # e.g., x in "x += 1"
+        # if not isinstance(target, ast.Name):
+        #     raise CompilerError(ERR_COMPLEX_ASSIGN, node)
 
         op = BIN_OPS.get(type(node.op))
         if op is None:
             raise CompilerError(ERR_UNSUPPORTED_OP, node)
 
         right = self.as_value(node.value)
-        self.ins_append(f'op {op} {target.id} {target.id} {right}')
+        self.ins_append(f'op {op} {target} {target} {right}')
         # TODO this needs to allow for complex expressions on the right-hand side
 
     def conditional_jump(self, destination_label, test, jump_if_test = True):
@@ -381,7 +468,8 @@ class Compiler(ast.NodeVisitor):
         for subnode in node.body:  # compile the "body" (commands to execute if test was true)
             self.visit(subnode)
         if node.orelse: # if there is an else (or elif) clause
-            self.ins_append(f'jump {endif_label} always') # jump from body down past else clause when test was true
+            if not self._current[-1].is_non_continuing: # if the if-true condition didn't jump away on its own
+                self.ins_append(f'jump {endif_label} always') # jump from body down past else clause when test was true
             self.ins_append( if_false_label )             # mark where we should jump to when test is false
             for subnode in node.orelse:  # compile the else-clause (commands to execute if test was false)
                 self.visit(subnode)
@@ -412,14 +500,17 @@ class Compiler(ast.NodeVisitor):
         #       this as another pre-canned for-loop option.  Of course there are other ways of writing this, but
         #       the same is true of iterating over links
 
-        target = node.target
-        if not isinstance(target, ast.Name):
-            raise CompilerError(ERR_COMPLEX_ASSIGN, node)
+        target = self.as_target(node.target)
+        # if not isinstance(target, ast.Name):
+        #     raise CompilerError(ERR_COMPLEX_ASSIGN, node)
             # TODO: again the problem isn't that "for 12 in range(5):" is *complex*, it's that 12 isn't the right sort of thing to assign values to
 
         call = node.iter
         if not isinstance(call, ast.Call):
             raise CompilerError(ERR_UNSUPPORTED_ITER, node)
+
+        body_label = self.Label("for_body") # will mark the beginning of the body of the loop
+        end_label = self.Label("for_end")   # will mark where to go after escaping loop
 
         inject = []
 
@@ -427,9 +518,9 @@ class Compiler(ast.NodeVisitor):
                 and call.func.value.id == 'Env' and call.func.attr == 'links':
             it = REG_IT_FMT.format(call.lineno, call.col_offset)
             start, end, step = 0, '@links', 1
-            inject.append(f'getlink {target.id} {it}')
+            inject.append(f'getlink {target} {it}')
         elif isinstance(call.func, ast.Name) and call.func.id == 'range':
-            it = target.id
+            it = target
             argv = call.args
             argc = len(argv)
             if argc == 1:
@@ -443,63 +534,56 @@ class Compiler(ast.NodeVisitor):
         else:
             raise CompilerError(ERR_UNSUPPORTED_ITER, node)
 
-        self.ins_append(f'set {it} {start}')
-
-        self.ins_append(f'jump {{}} greaterThanEq {it} {end}')
-        # TODO  if the step in range(start,stop,step) is negative, the relevant test is lessThanEq
-        condition = len(self._ins) - 1
-
-        self._ins.extend(inject)
-        for subnode in node.body:
+        self.ins_append(f'set {it} {start}') # set iterating variable to initial value
+        self.ins_append(f'jump {end_label} greaterThanEq {it} {end}') # if already past end skip loop entirely
+        # TODO  if the step in range(start,end,step) is negative, the relevant test is lessThanEq
+        self.ins_append(body_label) # mark beginning of body of for loop
+        self.ins_append(inject)     # append beginning of loop instructions, prepared above, if any
+        for subnode in node.body:   # compile body of loop
             self.visit(subnode)
-
-        self.ins_append(f'op add {it} {it} {step}')
-        self.ins_append(f'jump {condition} always')
-        self._ins[condition] = self._ins[condition].format(len(self._ins))
+        self.ins_append(f"op add {it} {it} {step}")            # increment the iterator
+        self.ins_append(f"jump {body_label} lessThan {it} {end}")   # if still before end, loop back up
+        # TODO  if the step in range(start,end,step) is negative, the relevant test is greaterThan
+        self.ins_append(end_label)  # mark end of for loop, in case first test skipped to here
 
     def visit_FunctionDef(self, node):
-        """This will be called for any* function definition of the form def fname( args ): body """
+        """This will be called for any* function definition of the form def fname( args ): body.
+           Pyndustric offers two compile modes for def statements, selectable by preceding the def-line with
+           one of the following decorators @inline, or @function.
+           The default mode @inline generally produces the fastest-executing mlog code.  This macro-like mode replaces
+           each function call with the body of the function, substituting the given arguments into that body wherever
+           relevant.  This has the consequence that, when a variable is passed as an argument and that argument is
+           assigned a new value in the body of the function, that variable will have that new value even after the
+           function returns, which differs from standard Python functions.  If you want to mask a variable so that it
+           can't be altered by an inline macro, precede it with 0+ in the function call.  E.g., inc(0+y) will first
+           set some temporary variable, temp = 0+y, and then process inc(temp), which may affect temp, but will not
+           affect y itself (unless the function specifically alters the global y).
+           The second @function mode instead compiles the function as a separate block of code, and uses various
+           set and jump instructions to pass argument values to the function and to jump to and from the function.also replaces each function call with the body of
+           the function, but replaces variable arguments with temp variables, so that assigning new values to args
+           in the function will not changethat function, that variable
+           will end up with a new l"""
 
-        # TODO forbid recursion (or implement it by storing and restoring everything from stack)
-        #      Telos: There's no need to actively forbid recursion, though it may be good to warn about dangers of it.
-        #             So long as there is no stack to overflow, recursion can work perfectly fine as a form of infinite
-        #             loop, or the recursion can be escaped with an end() command, a jump_to( label ) command, or simply
-        #             by entering into some other infinite loop and never return-ing. The key point is just to warn that
-        #             recursive calls will overwrite the value of the return pointer (if we follow my suggestion of
-        #             implementing that in a dummy variable to forego needing a stack) and thereby lose track of
-        #             whatever it was that called the function in the first place.  If you instead push return addresses
-        #             onto a stack, and wait to pop them at return-time, then recursion will still be fine, and will
-        #             even return all the way back to the first caller, with the only caveat being that all variables
-        #             are global, effectively including function arguments, so you have to be a bit cautious how
-        #             you write the code.
-        # TODO local variable namespace per-function
-        #      Telos:  I doubt that mindustry's processor-speed is fast enough to really make this worthwhile.
-        #              I'd recommend instead just documenting that mlog uses a single global namespace, and that
-        #              each call to a function overwrites the prior global values of its arguments.
-
-        if self._in_def is not None:
+        if self._in_def: # if we're already in the midst of defining another function
             raise CompilerError(ERR_NESTED_DEF, node)
         # TODO there's no reason we *couldn't* allow nested function defns, though it may be more tricky than it's worth
-        #      At first blush, I think these actually *probably* would work as is, if you remove this test banning them.
-        #      The main uses of nested function definitions involve namespaces which probly aren't worth bothering with.
-        #      Another use is to assign a function name to a different function definition, depending upon which
-        #      def(s) end up being executed. The best way to implement that would probably be to assign a variable for
-        #      each function name that points to the line number for whatever the current definition of that function
-        #      is, and rather than compiling def simply to jump past the body of the function, each time a def is
-        #      encountered, it should first change that function's name to point to this def's body, rather than
-        #      whatever other def of the same-named function it might previously have pointed to.  I.e., this would treat
-        #      function names as Python does, just as variables that point to an object that happens to be callable.
-        #      In some ways, this would be better than your unPythonic assumption that each function name can have only
-        #      one def in a program, though it would cost an instruction-cycle each time a def is "executed" which is
-        #      a pretty minor cost.  (Regardless, we probably should make an unPythonic assumption that a given
-        #      function-name will always accept the same arguments, though I suppose if we keep pushing positional args
-        #      on the stack to pass them, then we needn't even assume that!)
 
-        if node.name in self._functions or node.name == 'print':
+        name = node.name # the name of this function
+        if name == 'print' or name in FUNCTION_OPS or name in self._functions:
             raise CompilerError(ERR_REDEF, node)
 
-        self._in_def = node.name
-        reg_ret = f'{REG_RET_COUNTER_PREFIX}{len(self._functions)}'
+        # Currently this will end up making mode=="inline" (the default) or else mode=="function"
+        mode = DEF_COMPILE_MODES["default"]
+        if ( node.decorator_list and isinstance( node.decorator_list[0], ast.Name)):
+            mode = DEF_COMPILE_MODES.get( node.decorator_list[0].id )
+            if not mode: raise CompilerError(ERR_UNSUPPORTED_EXPR, node.decorator_list[0])
+            # TODO create more informative unknown decorator error
+
+        # mode actually doesn't play much role in function *definition*, since that just compiles the def body into
+        # the Function object (including remembering mode).  mode plays a big role in how function *calls* compile!
+
+        # return value variable is now specified as fn.return_value, created in Function.__init__
+        # reg_ret = f'{REG_RET_COUNTER_PREFIX}{len(self._functions)}'
 
         args = node.args
         if any((
@@ -511,52 +595,70 @@ class Compiler(ast.NodeVisitor):
                 args.defaults,
         )):
             raise CompilerError(ERR_INVALID_DEF, node)
-
         # TODO  many of the above could/should be supported
 
         # TODO it's better to put functions at the end and not have to skip them as code, but jumps need fixing
-        self.ins_append('jump {} always')
+        # self.ins_append('jump {} always')
 
-        prologue = len(self._ins)  # line number where the function definition begins
-        self._functions[node.name] = Function(start=prologue, argc=len(args.args))
+        # this is now handled with fn.call_label
+        # prologue = len(self._main)  # line number where the function definition begins
 
-        self.ins_append(f'read {reg_ret} cell1 {REG_STACK}')
-        for arg in args.args:
-            self.ins_append(f'op sub {REG_STACK} {REG_STACK} 1')
-            self.ins_append(f'read {arg.arg} cell1 {REG_STACK}')
+        # this is no longer used, is equiv to len(fn.args)
+        # argc=len(args.args)
 
-        # TODO argument passing would be more efficient if function-calling simply stored the arguments into the relevant
-        #      variables directly, rather than slowly piping them through a memory block, and this would also obviate
-        #      the need for an associated memory block.  (This would *not* however allow for recursion to retain
-        #      different namespaces for different levels, but to allow that we'd also need to store old values for the
-        #      namespace in the stack too, which would be really taxing for slow mindustry processors!)
+        fn = self._functions[name] = Function(name = name, mode=mode, args=[a.arg for a in args.args] )
+        self._in_def = fn # remember that we're now in the midst of defining this function
+        self._current = fn.ins # for now ins_append will add to this function's body, rather than to self._main
+
+        if mode == "function":
+            self.ins_append(fn.call_label) # jumpy functions need a label for calls to jump to
+
+        # # return line is now stored by caller in the variable named in fn.return_line
+        # self.ins_append(f'read {reg_ret} cell1 {REG_STACK}') #TODO to allow recursion this would need to stay on stack
+
+        # # arguments should now be set by the caller, so no need to unpack from stack!
+        # for arg in args.args:
+        #     self.ins_append(f'op sub {REG_STACK} {REG_STACK} 1')
+        #     self.ins_append(f'read {arg.arg} cell1 {REG_STACK}')
 
         for subnode in node.body:
-            self.visit(subnode)
+            self.visit(subnode) # when these call ins_append, instructions will be appended to this function's body
 
-        epilogue = len(self._ins)
-        # TODO use the new label system for these substitutions
+        # there is no longer a separate epilogue to jump to; instead returns jump straight back to sender
+        # epilogue = len(self._main)
+        # for i in range(prologue, epilogue):
+        #     if '{epilogue}' in self._main[i]:
+        #         self._main[i] = self._main[i].format(epilogue=epilogue)
 
-        for i in range(prologue, epilogue):
-            if '{epilogue}' in self._ins[i]:
-                self._ins[i] = self._ins[i].format(epilogue=epilogue)
+        if fn.ins and fn.ins[-1].is_non_continuing: # if fn already jumped away...
+            if mode=="inline" and fn.ins[-1]==fn.jump_back_instruction(at_end=False):
+                fn.ins.pop() # when inline fn ends with return, can eliminate pointless jump to its own end!
+        else: # if the function didn't jump away on its own we'll need to return for it
+            # TODO Python functions return None when reach end of body.  Is 0 the best mlog equivalent?
+            self.ins_append( f'set {{{fn.return_value}}} 0' ) # wrapped in braces for substitution
+            self.ins_append( fn.jump_back_instruction(at_end = True) )
 
-        # Add 1 to the return value to skip the jump that made the call.
-        self.ins_append(f'op add @counter {reg_ret} 1')
+        if mode == "inline":
+            self.ins_append( fn.end_label ) # any return commands in inline function will have tried to jump here
 
-        end = len(self._ins)
-        self._ins[prologue - 1] = self._ins[prologue - 1].format(end)
-        self._in_def = None
+        # jumpy functions are now appended at end of program so we didn't have to skip past function body at beginning
+        # end = len(self._main)
+        # self._main[prologue - 1] = self._main[prologue - 1].format(end)
+
+        self._in_def = None # back to reading statements as part of main program
+        self._current = self._main # now ins_append will add to main program, rather than this function's body
 
     def visit_Return(self, node):
         """This will be called for any instance of Return, typically from within a function definition."""
-        val = self.as_value(node.value)
-        self.ins_append(f'set {REG_RET} {val}')
-        self.ins_append('jump {epilogue} always')
-        # TODO  better to pass back the return value in a dummy variable, rather than requiring a stack
-        # TODO  maybe raise an error if not self._in_def  (can't return except when within a function definition)
-        #       what we have currently will end up leaving the {epilogue} in the compiled program
-        #       Or does AST itself enforce that Return must be within the scope of a Def?
+
+        if not self._in_def: raise CompilerError(ERR_NO_DEF, node)
+        # TODO is this the right error to raise for return when not in the midst of a def?
+        #      note: if source code is given as a def, top-level return will look perfectly syntactic to Python
+
+        self.create_Assign( '{'+self._in_def.return_value+'}', node.value ) # wrapped in braces for substitution
+        self.ins_append( self._in_def.jump_back_instruction(at_end = False) )
+        # self.ins_append('jump {epilogue} always')
+
 
     def visit_Expr(self, node):
         """This will be called for any* instance of an Expr, *** whatever exactly that is???."""
@@ -748,6 +850,29 @@ class Compiler(ast.NodeVisitor):
         else:
             raise CompilerError(ERR_UNSUPPORTED_SYSCALL, node)
 
+    def as_target(self, node):
+        """This will be called by various other methods when they encounter some node that specifies something target
+           variable that they need to assign a value to.  This returns that target as a string."""
+        if not isinstance(node, ast.Name):
+            raise CompilerError(ERR_COMPLEX_ASSIGN, node)
+            # TODO This rules out x,y = 30,50 (for which targets[0] will be the tuple (x,y) )  May want to support that?
+            # TODO Take care with how this will interact with vectorized operations
+        return self.as_name(node.id)
+
+    def as_name(self, name:str)->str:
+        """This takes a variable name, wraps it in {} if it is an arg in a function def to prepare it for
+           mangling/substitution, and maps it to its mlog @equivalent if it is a special variable. """
+        if self._in_def:
+            if name in self._in_def.args: name = '{'+name+'}' # wrap fn args in braces for substitution
+            #TODO if you want to mangle other local variables used in a function (not just args), the way to do that
+            #     would be to wrap them in {} here, store a list of such local args on the Function,
+            #     and change Function.mapped_ins() to include mangling for local variables in its default map
+
+        if name in AT_VARIABLES:  # e.g., Unit -> @unit,  This -> @this
+            name = AT_VARIABLES[name]
+
+        return name
+
     def as_value(self, node, allow_dummy = True):
         """This will be called by various other methods when they encounter some node that they'll need to treat as an
            atomic expression in mlog code, e.g. for both y and 3 in x=y+3.  This coerces the given node to a string that
@@ -777,17 +902,14 @@ class Compiler(ast.NodeVisitor):
             else:
                 raise CompilerError(ERR_COMPLEX_VALUE, node)
 
-        elif isinstance(node, ast.Name):
+        elif isinstance(node, ast.Name): # variable names
             assert isinstance(node.ctx, ast.Load)
             # TODO should this raise a CompilerError like most other errors do?
             #      I guess the plan is that as_value won't get called for variables in the .Store context (e.g.,
             #      the x in x = y) so this assertion would just serve to warn us that we'd called as_value at a time
             #      that we hadn't meant to, so the error is probably ours and not the users, so no compiler error?
             #      Should probably just remove this once we're confident our code works?
-
-            #TODO capture special variable names like Unit and This and map them to their mlog equivs @unit, @this
-
-            return node.id
+            return self.as_name(node.id)
 
         # most calls will be handled in create_Assign. But Env.methods compile to @variables, so handled here.
         elif ( isinstance(node, ast.Call) and
@@ -818,18 +940,26 @@ class Compiler(ast.NodeVisitor):
         return var
 
     def generate_masm(self):
-        """This will be called after the full list self._ins of mlog instructions is generated and optimized.
+        """This will be called after the full list self._main of mlog instructions is generated and optimized.
            This concatenates these together into a single string of mlog assembly (masm) code, and substitutes in
            finalized line numbers for the various jump labels."""
 
+        if any(fn.mode != "inline" for fn in self._functions.values()):
+            # TODO could trim this instruction if preceding line is end or jump...always
+            self.ins_append("jump 0 always") # jump back to beginning since all that's left is function def bodies
+
+        for fn in self._functions.values():  # append the body of each jumpy function to the end of the program
+            if fn.mode != "inline":
+                self.ins_append(fn.mapped_ins())
+
         n = 0                      # current line number
         labels_to_linenumbers = {} # will map each used label name to the linenumber of its jump destination
-        for i in self._ins:  # assign finalized line numbers to all instructions/labels
-            # i.linenumber = n # not actually needed yet, and would cause errors if any non-Instruction str's in ._ins
+        for i in self._main:  # assign finalized line numbers to all instructions/labels
+            # i.linenumber = n # not actually needed yet, and would cause errors if any non-Instruction str's in ._main
             if not i and i.label: labels_to_linenumbers[i.label.name] = n # remember what number to map this label to
             if i: n+=1  # unless i was an empty no-op instruction (a label destination), increment line number count
 
-        # TODO I've updated most additions to ._ins to append actual Instructions, rather than mere strings,
+        # TODO I've updated most additions to ._main to append actual Instructions, rather than mere strings,
         #      but not quite all.  The main exceptions are old ad hoc substitutions of line numbers into strings,
         #      which end up replacing actual Instructions with mere strings.  These should probably be reworked to
         #      use the new label system for line-number substitution (and will likely *have* to be reworked this way
@@ -839,9 +969,14 @@ class Compiler(ast.NodeVisitor):
         if n > MAX_INSTRUCTIONS:
             raise CompilerError(ERR_TOO_LONG, ast.Module(lineno=0, col_offset=0))
 
+        print("\n---- Readable nearly-compiled code with jump labels -------------------------")
+        for i in self._main:
+            print( "  ", i.__repr__() )
+        print("-----------------------------------------------------------------------------")
+
         # concatenate non-empty instructions together into a long string broken by newline characters
         # at this point, jump instructions will still contain {labels} rather than actual linenumbers
-        masm_with_labels = '\n'.join(i for i in self._ins if i)
+        masm_with_labels = '\n'.join(i for i in self._main if i)
 
         #TODO it's not at all clear that you really want an explicit 'end' here!  My understanding is that
         #   'end' wipes all variables, whereas simply reaching the end with no explicit 'end' command instead

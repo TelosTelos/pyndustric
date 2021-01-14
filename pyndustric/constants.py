@@ -36,6 +36,11 @@ ERROR_DESCRIPTIONS = {
     ERR_TOO_LONG: 'the program is too long to fit in a logic processor',
 }
 
+DEF_COMPILE_MODES = {'default': 'inline',
+                     'inline': 'inline',
+                     'function': 'function'}
+
+
 BIN_CMP = {
     ast.Eq: 'equal',
     ast.NotEq: 'notEqual',
@@ -108,6 +113,14 @@ ENV_TO_VAR = {
     'width': '@mapw',
     'height': '@maph',
 }
+
+AT_VARIABLES = { 'Unit':'@unit',
+                 'This':'@this',
+                 'Counter': '@counter',
+                 'Links': '@links',
+                 'Time': '@time',
+                 'Mapw': '@mapw',
+                 'Maph': '@maph' }
 
 RES_MAP = {
     'copper': '@copper',

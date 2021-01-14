@@ -3,9 +3,10 @@ import pytest
 import textwrap
 
 
-def as_masm(source):
-    return 'set __pyc_sp 0\n' + textwrap.dedent(source).strip() # + '\nend\n'
-    # Telos:  I removed the postfix end command, since not all programs will want it
+def as_masm(s:str):
+    return textwrap.dedent(s).strip()
+    # return 'set __pyc_sp 0\n' + textwrap.dedent(s).strip() # + '\nend\n'
+    # Telos:  I removed the postfix end command, since not all programs will want it, and also the stack prefix
 
 
 def test_all_err_have_desc_and_tests():
@@ -298,9 +299,9 @@ def test_if_else():
 
     expected = as_masm('''\
         set x 1
-        jump 5 equal x 0
+        jump 4 equal x 0
         set y 1
-        jump 6 always
+        jump 5 always
         set y 0
         set z 1
         ''')
@@ -388,12 +389,12 @@ def test_while_and():
     expected = as_masm('''\
         set x 10
         set y 5
-        jump 9 equal x 0 
-        jump 9 equal y 0 
+        jump 8 equal x 0 
+        jump 8 equal y 0 
         op sub x x 1
         op sub y y 1
-        jump 9 equal x 0 
-        jump 5 notEqual y 0 
+        jump 8 equal x 0 
+        jump 4 notEqual y 0 
         set z 1
         ''')
 
@@ -414,12 +415,12 @@ def test_while_or():
     expected = as_masm('''\
         set x 0
         set y 1
-        jump 5 notEqual x 0 
-        jump 9 Equal y 0 
+        jump 4 notEqual x 0 
+        jump 8 Equal y 0 
         set x y
         op sub y y x
-        jump 5 notEqual x 0 
-        jump 5 notEqual y 0 
+        jump 4 notEqual x 0 
+        jump 4 notEqual y 0 
         set z 1
         ''')
 
@@ -436,10 +437,10 @@ def test_for():
 
     expected = as_masm('''\
         set x 0
-        jump 6 greaterThanEq x 10
+        jump 5 greaterThanEq x 10
         op add y x x
         op add x x 1
-        jump 2 always
+        jump 2 lessThan x 10
         set z 1
         ''')
 
@@ -462,11 +463,38 @@ def test_for():
     masm = pyndustric.Compiler().compile(source)
     assert 'op add x x 3' in masm
 
+def test_for_functions():
+    # The test is set for default inline functions, but uncommenting either @function will switch that
+    def source():
+        #@function
+        def square(i): return i*i
+        #@function
+        def hyper(n):
+            a = 2
+            for i in range(n):
+                a = square(a)
+            return a
+        b = hyper(4)
+
+    expected = as_masm('''\
+        set a 2
+        set i 0
+        jump 6 greaterThanEq i 4
+        op mul a a a
+        op add i i 1
+        jump 3 lessThan i 4
+        set b a
+        ''')
+
+    masm = pyndustric.Compiler().compile(source)
+    assert expected == masm
+
 
 def test_def():
     # TODO cells can't store strings, test that no fn args are
     # TODO standalone calls are not supported
     source = textwrap.dedent('''\
+        @function
         def small(n):
             if n < 10:
                 return True
@@ -479,27 +507,59 @@ def test_def():
         ''')
 
     expected = as_masm('''\
+        set __small_n 5
+        op add __small_RETURN_LINE @counter 1
+        jump 14 always
+        set a __small_RETURN_VALUE
+        set __small_n 15
+        op add __small_RETURN_LINE @counter 1
+        jump 14 always
+        set b __small_RETURN_VALUE
+        print "5 small? "
+        print a
+        print ", 15 small? "
+        print b
+        printflush message1
+        jump 0 always
+        jump 17 greaterThanEq __small_n 10
+        set __small_RETURN_VALUE true
+        set @counter __small_RETURN_LINE
+        set __small_RETURN_VALUE false
+        set @counter __small_RETURN_LINE
+        set __small_RETURN_VALUE 0
+        set @counter __small_RETURN_LINE
+        ''')
+
+    masm = pyndustric.Compiler().compile(source)
+    assert masm == expected
+
+def test_inline_def():
+    source = textwrap.dedent('''\
+        @inline
+        def small(n):
+            if n < 10:
+                return True
+            else:
+                return False
+
+        a = small(5)
+        b = small(15)
+        print(f'5 small? {a}, 15 small? {b}')
+        ''')
+
+    expected = as_masm('''\
+        jump 3 greaterThanEq 5 10
+        set a true
+        jump 6 always
+        set a false
+        jump 6 always
+        set a 0
+        jump 9 greaterThanEq 15 10
+        set b true
         jump 12 always
-        read __pyc_rc_0 cell1 __pyc_sp
-        op sub __pyc_sp __pyc_sp 1
-        read n cell1 __pyc_sp
-        jump 9 lessThan n 10
-        set __pyc_ret false
-        jump 11 always
-        jump 11 always
-        set __pyc_ret true
-        jump 11 always
-        op add @counter __pyc_rc_0 1
-        write 5 cell1 __pyc_sp
-        op add __pyc_sp __pyc_sp 1
-        write @counter cell1 __pyc_sp
-        jump 2 always
-        set a __pyc_ret
-        write 15 cell1 __pyc_sp
-        op add __pyc_sp __pyc_sp 1
-        write @counter cell1 __pyc_sp
-        jump 2 always
-        set b __pyc_ret
+        set b false
+        jump 12 always
+        set b 0
         print "5 small? "
         print a
         print ", 15 small? "
@@ -510,31 +570,58 @@ def test_def():
     masm = pyndustric.Compiler().compile(source)
     assert masm == expected
 
-def test_multi_call():
-    # TODO cells can't store strings, test that no fn args are
-    # TODO standalone calls are not supported
+def test_inline_def_shielding():
+    """This embeds a copy of the function each place it is "called", substituting the given values in place of its
+       args.  As a consequence, this inline function adjusts the value of the given arg y, much like C's ++y.
+       The second call shields y from being further modified with the 0+'s."""
     def source():
+        @inline
+        def inc(x):
+            x = x+1
+            return x
+        y = 1
+        z = inc(y) * inc(y)
+        w = inc(0+y) * inc(0+y)
+
+    expected = as_masm('''\
+        set y 1
+        op add y y 1
+        set __temp_0 y
+        op add y y 1
+        set __temp_1 y
+        op mul z __temp_0 __temp_1
+        op add __temp_3 0 y
+        op add __temp_3 __temp_3 1
+        set __temp_2 __temp_3
+        op add __temp_5 0 y
+        op add __temp_5 __temp_5 1
+        set __temp_4 __temp_5
+        op mul w __temp_2 __temp_4
+        ''')
+    masm = pyndustric.Compiler().compile(source)
+    assert masm == expected
+
+
+def test_multi_call():
+    # This is especially trivial with inlining, but also works with out-of-line function
+    def source():
+        @function
         def f(i): return i
         x = f(1)+f(2)
 
     expected = as_masm('''\
-        set __pyc_sp 0
-        jump 8 always
-        read __pyc_rc_0 cell1 __pyc_sp
-        op sub __pyc_sp __pyc_sp 1
-        read i cell1 __pyc_sp
-        set __pyc_ret i
-        jump 7 always
-        op add @counter __pyc_rc_0 1
-        write 1 cell1 __pyc_sp
-        op add __pyc_sp __pyc_sp 1
-        write @counter cell1 __pyc_sp
-        jump 2 always
-        write 2 cell1 __pyc_sp
-        op add __pyc_sp __pyc_sp 1
-        write @counter cell1 __pyc_sp
-        jump 2 always
+        set __f_i 1
+        op add __f_RETURN_LINE @counter 1
+        jump 10 always
+        set __temp_0 __f_RETURN_VALUE
+        set __f_i 2
+        op add __f_RETURN_LINE @counter 1
+        jump 10 always
+        set __temp_1 __f_RETURN_VALUE
         op add x __temp_0 __temp_1
+        jump 0 always
+        set __f_RETURN_VALUE __f_i
+        set @counter __f_RETURN_LINE
         ''')
 
     masm = pyndustric.Compiler().compile(source)
@@ -542,28 +629,22 @@ def test_multi_call():
 
 
 def test_complex_call():
-    # TODO cells can't store strings, test that no fn args are
-    # TODO standalone calls are not supported
+    # this is trivial for inline, quite trivial for out-of-line functions
     def source():
+        @function
         def f(i): return i
         x = 1*f(2+3)+4
 
     expected = as_masm('''\
-        set __pyc_sp 0
-        jump 8 always
-        read __pyc_rc_0 cell1 __pyc_sp
-        op sub __pyc_sp __pyc_sp 1
-        read i cell1 __pyc_sp
-        set __pyc_ret i
+        op add __f_i 2 3
+        op add __f_RETURN_LINE @counter 1
         jump 7 always
-        op add @counter __pyc_rc_0 1
-        op add __temp_2 2 3
-        write __temp_2 cell1 __pyc_sp
-        op add __pyc_sp __pyc_sp 1
-        write @counter cell1 __pyc_sp
-        jump 2 always
+        set __temp_1 __f_RETURN_VALUE
         op mul __temp_0 1 __temp_1
         op add x __temp_0 4
+        jump 0 always
+        set __f_RETURN_VALUE __f_i
+        set @counter __f_RETURN_LINE
         ''')
 
     masm = pyndustric.Compiler().compile(source)
@@ -573,6 +654,7 @@ def test_complex_call():
 
 def test_def_sideeffects():
     source = textwrap.dedent('''\
+        @function
         def foo():
             print('bar')
 
@@ -580,13 +662,14 @@ def test_def_sideeffects():
         ''')
 
     expected = as_masm('''\
-        jump 6 always
-        read __pyc_rc_0 cell1 __pyc_sp
+        op add __foo_RETURN_LINE @counter 1
+        jump 4 always
+        set __temp_0 __foo_RETURN_VALUE
+        jump 0 always
         print "bar"
         printflush message1
-        op add @counter __pyc_rc_0 1
-        write @counter cell1 __pyc_sp
-        jump 2 always
+        set __foo_RETURN_VALUE 0
+        set @counter __foo_RETURN_LINE
         ''')
 
     masm = pyndustric.Compiler().compile(source)
@@ -594,32 +677,30 @@ def test_def_sideeffects():
 
 
 def test_def_call_as_call_arg():
-    source = textwrap.dedent('''\
-        def square(n):
-            n **= 2
-            return n
+    # the inline version is two instructions (which makes sense), and the out-of-line function is 9
+    def source():
+        @inline
+        def isquare(n): return n**2
 
-        r = square(square(2))
-        ''')
+        @function
+        def fsquare(n): return n**2
+
+        r = isquare(isquare(2))
+        s = fsquare(fsquare(2))
 
     expected = as_masm('''\
-        jump 9 always
-        read __pyc_rc_0 cell1 __pyc_sp
-        op sub __pyc_sp __pyc_sp 1
-        read n cell1 __pyc_sp
-        op pow n n 2
-        set __pyc_ret n
-        jump 8 always
-        op add @counter __pyc_rc_0 1
-        write 2 cell1 __pyc_sp
-        op add __pyc_sp __pyc_sp 1
-        write @counter cell1 __pyc_sp
-        jump 2 always
-        write __pyc_ret cell1 __pyc_sp
-        op add __pyc_sp __pyc_sp 1
-        write @counter cell1 __pyc_sp
-        jump 2 always
-        set r __pyc_ret
+        op pow __temp_0 2 2
+        op pow r __temp_0 2
+        set __fsquare_n 2
+        op add __fsquare_RETURN_LINE @counter 1
+        jump 10 always
+        set __fsquare_n __fsquare_RETURN_VALUE
+        op add __fsquare_RETURN_LINE @counter 1
+        jump 10 always
+        set s __fsquare_RETURN_VALUE
+        jump 0 always
+        op pow __fsquare_RETURN_VALUE __fsquare_n 2
+        set @counter __fsquare_RETURN_LINE
         ''')
 
     masm = pyndustric.Compiler().compile(source)
@@ -652,6 +733,7 @@ def test_print():
 
 
 def test_env():
+    # TODO this seems not to work
     source = textwrap.dedent('''\
         this = Env.this()
         x = Env.x()
